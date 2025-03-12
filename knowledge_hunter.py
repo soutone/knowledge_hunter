@@ -21,7 +21,7 @@ openai_client = OpenAI(api_key=my_api_key)
 #########################################
 # 3) CONFIG / CONSTANTS
 #########################################
-MAX_DEPTH = 2
+MAX_DEPTH = 3
 VALID_MD_EXTENSIONS = (".md", ".markdown", ".mdx")
 TOKEN_CHUNK_SIZE = 10000  # e.g. for a 128k context model, leave overhead
 
@@ -182,7 +182,7 @@ def main():
     # Example usage:
 
     # start_url = "https://github.com/openai/openai-python"
-    start_url = "https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/index.html"
+    start_url = "https://microsoft.github.io/autogen/stable/"
 
     print(f"[main] Starting scrape from: {start_url} with model {model_name}")
 
