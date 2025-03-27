@@ -1,4 +1,7 @@
 {
-  "e140de42bdda2ccda2cd92de0a35bf96fc46381bc7674eeb9bc81e044199f17f": "openai_python_changelog_summary_github.com",
-  "1933de7d0418fc8dc14e0de690611dfb82392b658bf44e832d87d0611d00458c": "openai_python_changelog_summary_github.com"
+  "eb33d36da592855b5796694f3ce252b91bcbc19ea06f926195e4f54065760e27": "asyncio_concurrent_programming_basics_docs.python.org",
+  "64d0d013fb89cea4fbcf790ff2e8953e0afc74d3bd4efcb91f8ae87baba1c659": "terraform_registry_usage_guide_registry.terraform.io",
+  "601424618e1a1dd3a422916e66ef2d4611df35e2e0d2720ea1a253bdc18f1b91": "quart_tutorials_async_web_framework_quart.palletsprojects.com",
+  "9f4901164fe8480900d4be5520410ca87a21cae93e1c15eb3461ac26ac535617": "terraform_infrastructure_as_code_basics_developer.hashicorp.com",
+  "b168833d3105d79fa011332df76ba101b3c942ef13a6565d2dc9a3c1c25c8d56": "agentchat_module_overview_microsoft.github.io"
 }

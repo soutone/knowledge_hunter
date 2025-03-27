@@ -1,4 +1,5 @@
-import requests
+import asyncio
+import httpx
 import tiktoken
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
@@ -7,116 +8,150 @@ from dotenv import load_dotenv
 import os
 import hashlib
 import json
+import time
+import re
+from collections import Counter
 
 load_dotenv(override=True)
 
-# === 1. Setup OpenAI Client ===
-def get_api_key():
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        try:
-            with open("my_secrets", "r", encoding="utf-8") as f:
-                api_key = f.read().strip()
-        except FileNotFoundError:
-            print("ERROR: OpenAI API key not found.")
-            exit(1)
-    return api_key
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-openai_client = OpenAI(api_key=get_api_key())
-
-# === 2. Constants ===
 DEFAULT_MAX_DEPTH = 2
-VALID_MD_EXTENSIONS = (".md", ".markdown", ".mdx")
-TOKEN_CHUNK_SIZE = 10000
 FILENAME_CACHE_PATH = "filename_cache.json"
 OUTPUT_FOLDER = "output"
+MODEL_CONTEXT_LIMITS = {
+    "gpt-3.5-turbo": 4096,
+    "gpt-3.5-turbo-16k": 16384,
+    "gpt-4": 8192,
+    "gpt-4-32k": 32768,
+    "gpt-4o": 128000,
+    "gpt-4o-2024-08-06": 128000,
+}
+
+MAX_CONCURRENCY = 2
+semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 filename_cache = json.load(open(FILENAME_CACHE_PATH)) if os.path.exists(FILENAME_CACHE_PATH) else {}
 
-# === 3. Tokenizer ===
 def get_tokenizer_for_model(model_name: str):
     try:
         return tiktoken.encoding_for_model(model_name)
     except KeyError:
         return tiktoken.get_encoding("cl100k_base")
 
-# === 4. Scrapers ===
-def scrape_github_markdown(url, visited=None, depth=0, max_depth=DEFAULT_MAX_DEPTH):
-    if visited is None:
-        visited = set()
-    if depth > max_depth:
-        return ""
+async def fetch_html(client, url):
+    async with semaphore:
+        try:
+            resp = await client.get(url, timeout=10)
+            if resp.status_code == 200:
+                return resp.text
+        except Exception as e:
+            print(f"[Async] Error fetching {url}: {e}")
+    return ""
 
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return ""
-        html = r.text
-    except Exception as e:
-        print(f"[GitHub] Error accessing {url}: {e}")
-        return ""
+def extract_keywords(text: str, top_k: int = 20) -> list[str]:
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
+    common = Counter(words).most_common(top_k)
+    return [word for word, _ in common]
 
-    visited.add(url)
-    print(f"[GitHub] Crawling ({depth}): {url}")
-    soup = BeautifulSoup(html, "html.parser")
+def score_link(url: str, keywords: list[str]) -> int:
+    return sum(kw in url.lower() for kw in keywords)
 
-    if "/blob/" in url and url.endswith(VALID_MD_EXTENSIONS):
-        article = soup.find("article", {"class": "markdown-body"})
-        if article:
-            return article.get_text(separator="\n")
+async def async_scrape_website(start_url, max_depth=DEFAULT_MAX_DEPTH):
+    visited = set()
+    domain = urlparse(start_url).netloc
+    topic_keywords = []
 
-    contents = []
-    for link in soup.find_all("a", href=True):
-        abs_url = urljoin("https://github.com", link["href"])
-        if abs_url not in visited:
-            if "/blob/" in abs_url and abs_url.endswith(VALID_MD_EXTENSIONS):
-                contents.append(scrape_github_markdown(abs_url, visited, depth + 1, max_depth))
-            elif "/tree/" in abs_url:
-                contents.append(scrape_github_markdown(abs_url, visited, depth + 1, max_depth))
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        async def crawl(url, depth):
+            nonlocal topic_keywords
 
-    return "\n".join(contents)
+            if depth > max_depth or url in visited:
+                return ""
 
-def scrape_website(url, visited=None, depth=0, max_depth=DEFAULT_MAX_DEPTH):
-    if visited is None:
-        visited = set()
-    if depth > max_depth:
-        return ""
+            visited.add(url)
+            html = await fetch_html(client, url)
+            if not html:
+                return ""
 
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return ""
-        html = r.text
-    except Exception as e:
-        print(f"[Site] Error accessing {url}: {e}")
-        return ""
+            print(f"[Async] Crawling ({depth}): {url}")
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "header", "footer", "nav"]):
+                tag.decompose()
+            content = soup.get_text(separator="\n")
 
-    visited.add(url)
-    print(f"[Site] Crawling ({depth}): {url}")
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "header", "footer", "nav"]):
-        tag.decompose()
+            if depth == 0:
+                topic_keywords = extract_keywords(content)
+                print(f"[Async] Topical keywords: {topic_keywords}")
 
-    text_content = [soup.get_text(separator="\n")]
-    domain = urlparse(url).netloc
-    for link in soup.find_all("a", href=True):
-        abs_url = urljoin(url, link["href"])
-        if abs_url not in visited and urlparse(abs_url).netloc == domain:
-            text_content.append(scrape_website(abs_url, visited, depth + 1, max_depth))
+            tasks = []
+            for link in soup.find_all("a", href=True):
+                abs_url = urljoin(url, link["href"])
+                if urlparse(abs_url).netloc == domain and abs_url not in visited:
+                    if depth == 0 or score_link(abs_url, topic_keywords) >= 1:
+                        tasks.append(crawl(abs_url, depth + 1))
 
-    return "\n".join(text_content)
+            sub_contents = await asyncio.gather(*tasks)
+            return content + "\n" + "\n".join(sub_contents)
 
-# === 5. Chunking & Summarization ===
-def chunk_text_by_tokens(text: str, tokenizer, max_tokens=TOKEN_CHUNK_SIZE):
-    token_ids = tokenizer.encode(text)
-    return [tokenizer.decode(token_ids[i:i + max_tokens]) for i in range(0, len(token_ids), max_tokens)]
+        return await crawl(start_url, depth=0)
+
+def get_dynamic_token_chunk_size(model_name: str, output_buffer_tokens: int = 1000, safety_margin: int = 3000) -> int:
+    context_limit = MODEL_CONTEXT_LIMITS.get(model_name, 8192)
+    return context_limit - output_buffer_tokens - safety_margin
+
+def chunk_text_by_tokens(text: str, tokenizer, max_tokens: int):
+    paragraphs = text.split("\n\n")
+    chunks = []
+    buffer = []
+    buffer_tokens = 0
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        tokens = tokenizer.encode(para, disallowed_special=())
+
+        if len(tokens) > max_tokens:
+            for i in range(0, len(tokens), max_tokens):
+                split_chunk = tokenizer.decode(tokens[i:i + max_tokens])
+                chunks.append(split_chunk.strip())
+            buffer = []
+            buffer_tokens = 0
+            continue
+
+        if buffer_tokens + len(tokens) > max_tokens:
+            chunks.append("\n\n".join(buffer).strip())
+            buffer = [para]
+            buffer_tokens = len(tokens)
+        else:
+            buffer.append(para)
+            buffer_tokens += len(tokens)
+
+    if buffer:
+        chunks.append("\n\n".join(buffer).strip())
+
+    # Final safety filter: ensure each chunk is under max_tokens
+    safe_chunks = []
+    for i, chunk in enumerate(chunks):
+        tokens = tokenizer.encode(chunk, disallowed_special=())
+        for j in range(0, len(tokens), max_tokens):
+            sub_chunk = tokenizer.decode(tokens[j:j + max_tokens])
+            safe_chunks.append(sub_chunk)
+            print(f"[Chunking] Final chunk {len(safe_chunks)} has {len(tokens[j:j + max_tokens])} tokens")
+
+    return safe_chunks
+
+
 
 def summarize_text(text_chunk: str, model_name: str):
     system_prompt = (
-        "You are summarizing documentation or markdown instructions to feed into ChatGPT. "
-        "Keep function signatures, code snippets, and usage examples intact in triple backticks. "
-        "Shorten extraneous text but don't remove essential detail or code."
+        "You are summarizing highly technical documentation for developers."
+        " Preserve all code blocks, commands, CLI tools, functions, configuration details, and specific terminology."
+        " Wrap any code or commands in triple backticks."
+        " Do not omit usage examples, flags, or syntax."
+        " Summarize only redundant prose or introductory text."
     )
 
     try:
@@ -127,38 +162,69 @@ def summarize_text(text_chunk: str, model_name: str):
                 {"role": "user", "content": text_chunk}
             ],
             temperature=0.0,
-            max_tokens=1000
+            max_tokens=2000
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         print(f"[Summarize] Error summarizing chunk: {e}")
         return ""
 
-# === 6. Filename Generation with Cache ===
-def make_cache_key(url, content):
-    return hashlib.sha256((url.lower().strip() + hashlib.sha256(content.encode("utf-8")).hexdigest()[:10]).encode("utf-8")).hexdigest()
+def summarize_text_with_retry(text_chunk: str, model_name: str, max_retries: int = 5):
+    delay = 10
+    for attempt in range(max_retries):
+        result = summarize_text(text_chunk, model_name)
+        if result:
+            return result
+        print(f"[Retry] Waiting {delay}s before retrying...")
+        time.sleep(delay)
+        delay *= 1.5
+    return ""
+
+def consolidate_summaries(summaries, model_name):
+    joined = "\n\n".join(summaries)
+    consolidation_prompt = (
+        "Consolidate the following technical summaries into a single, clear structure."
+        " Ensure *no* technical detail is lost. Preserve ALL code examples, CLI commands, flags, and configurations."
+        " Use clear Markdown structure if possible."
+    )
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": consolidation_prompt},
+                {"role": "user", "content": joined}
+            ],
+            temperature=0.0,
+            max_tokens=3000
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[Consolidate] Error consolidating summaries: {e}")
+        return joined
+
+def make_cache_key(url, content=None):
+    return hashlib.sha256(url.lower().strip().encode("utf-8")).hexdigest()
 
 def generate_descriptive_filename(content: str, url: str, model_name: str) -> str:
-    key = make_cache_key(url, content)
+    key = make_cache_key(url)
     if key in filename_cache:
         return filename_cache[key]
 
     domain = urlparse(url).netloc.lower()
     prompt = f"""
-    Based on the following content scraped from {url}, generate a short, descriptive filename (without extension) 
-    that captures the main topic. Use 3-5 words with underscores instead of spaces. No file extension.
+    Based on the following content scraped from {url}, generate a short, descriptive filename (no extension).
+    Use 3-5 lowercase words, separated by underscores. Do NOT include a file extension.
 
     Content sample:
-    {content[:5000]}
-
-    Output just the filename.
+    {content[:3000]}
     """
 
     try:
         response = openai_client.chat.completions.create(
             model=model_name,
             messages=[
-                {"role": "system", "content": "You generate concise, descriptive filenames based on content."},
+                {"role": "system", "content": "You generate concise, descriptive filenames."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.0,
@@ -177,35 +243,45 @@ def generate_descriptive_filename(content: str, url: str, model_name: str) -> st
             json.dump(filename_cache, f, indent=2)
         return fallback
 
-# === 7. Main ===
+async def summarize_chunk(index, chunk, model_name):
+    print(f"[Async] Summarizing chunk {index}")
+    return await asyncio.to_thread(summarize_text_with_retry, chunk, model_name)
+
+async def summarize_all_chunks(chunks, model_name):
+    tasks = [summarize_chunk(i, chunk, model_name) for i, chunk in enumerate(chunks, 1)]
+    return await asyncio.gather(*tasks)
+
 def main():
     model_name = "gpt-4o-2024-08-06"
-    max_chunk_tokens = TOKEN_CHUNK_SIZE
+    max_chunk_tokens = get_dynamic_token_chunk_size(model_name)
 
-    start_url = input("Enter the URL to scrape (default: https://github.com/openai/openai-python): ").strip() or "https://github.com/openai/openai-python"
+    start_url = input("Enter the URL to scrape (default: https://openai.com): ").strip() or "https://openai.com"
     max_depth_input = input(f"Enter max crawl depth (default: {DEFAULT_MAX_DEPTH}): ").strip()
     max_depth = int(max_depth_input) if max_depth_input.isdigit() else DEFAULT_MAX_DEPTH
 
-    print(f"[Main] Starting crawl from: {start_url} (depth={max_depth}) using model {model_name}")
+    print(f"[Main] Starting async crawl from: {start_url} (depth={max_depth}) using model {model_name}")
     tokenizer = get_tokenizer_for_model(model_name)
 
-    domain = urlparse(start_url).netloc.lower()
-    all_text = scrape_github_markdown(start_url, max_depth=max_depth) if "github.com" in domain else scrape_website(start_url, max_depth=max_depth)
+    all_text = asyncio.run(async_scrape_website(start_url, max_depth=max_depth))
 
     if not all_text.strip():
         print("[Main] No content scraped. Exiting.")
         return
 
     print("[Main] Chunking text...")
+    start = time.time()
     chunks = chunk_text_by_tokens(all_text, tokenizer, max_tokens=max_chunk_tokens)
+    print(f"[Main] Chunking complete. Took {time.time() - start:.2f}s")
     print(f"[Main] {len(all_text)} characters => {len(chunks)} chunk(s).")
 
-    summaries = []
-    for i, chunk in enumerate(chunks, 1):
-        print(f"[Main] Summarizing chunk {i}/{len(chunks)}")
-        summaries.append(summarize_text(chunk, model_name))
+    summaries = asyncio.run(summarize_all_chunks(chunks, model_name))
 
-    final_summary = "\n\n".join(summaries)
+    if len(summaries) > 1:
+        print("[Main] Consolidating summaries...")
+        final_summary = consolidate_summaries(summaries, model_name)
+    else:
+        final_summary = summaries[0]
+
     output_path = os.path.join(OUTPUT_FOLDER, generate_descriptive_filename(final_summary, start_url, model_name) + ".txt")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(final_summary)
