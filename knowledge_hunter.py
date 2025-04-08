@@ -288,5 +288,13 @@ def main():
 
     print(f"[Main] Summary saved to {output_path}")
 
+    # ✅ Run compiler.py to combine all summaries
+    try:
+        print("[Main] Running compiler.py to combine all summaries...")
+        import compiler
+        compiler.compile_txt_files()
+    except Exception as e:
+        print(f"[Main] Failed to run compiler: {e}")
+
 if __name__ == "__main__":
     main()
