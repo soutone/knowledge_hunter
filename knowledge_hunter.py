@@ -156,30 +156,19 @@ def score_link_quick(haystack, keywords):
 def get_allowed_base_path(url_str):
     """
     Determines the allowed base path for crawling (up to one level above the start URL's directory).
-    e.g., https://example.com/docs/product/category/page.html -> https://example.com/docs/product/
-    e.g., https://example.com/docs/product/ -> https://example.com/docs/
-    e.g., https://example.com/docs/ -> https://example.com/
+    e.g., [https://example.com/docs/product/category/page.html](https://example.com/docs/product/category/page.html) -> [https://example.com/docs/product/](https://example.com/docs/product/)
+    e.g., [https://example.com/docs/product/](https://example.com/docs/product/) -> [https://example.com/docs/](https://example.com/docs/)
+    e.g., [https://example.com/docs/](https://example.com/docs/) -> [https://example.com/](https://example.com/)
     """
     parsed = urlparse(url_str)
-    # Use pathlib for robust path manipulation
     p = Path(parsed.path)
-
-    # If the path ends with a filename (has a suffix), get the parent dir first
-    # Otherwise, treat the current path as the directory
     current_dir = p.parent if p.suffix else p
-
-    # Get the parent of the current directory (one level up)
     parent_dir = current_dir.parent
-
-    # Ensure the path ends with a slash
-    allowed_path = str(parent_dir).replace('\\', '/') # Ensure forward slashes
+    allowed_path = str(parent_dir).replace('\\', '/')
     if not allowed_path.endswith('/'):
         allowed_path += '/'
-    # Handle the root case separately
     if allowed_path == "//":
          allowed_path = "/"
-
-    # Reconstruct the base URL
     base_url_parts = (parsed.scheme, parsed.netloc, allowed_path, '', '', '')
     return urlunparse(base_url_parts)
 
@@ -190,10 +179,8 @@ async def async_scrape_website(start_url, max_depth, topic_vec, seed_keywords):
     content_map = {}
     parsed_start_url = urlparse(start_url)
     domain = parsed_start_url.netloc
-    # --- Calculate allowed base path ---
     allowed_base_path = get_allowed_base_path(start_url)
     print(f"[Async] Restricting crawl to base path: {allowed_base_path}")
-    # -----------------------------------
     all_keywords = list(dict.fromkeys(seed_keywords))
     print(f"[Async] Initial keywords: {all_keywords}")
 
@@ -260,17 +247,12 @@ async def async_scrape_website(start_url, max_depth, topic_vec, seed_keywords):
                         abs_url = urljoin(url, href)
                         parsed_abs_url = urlparse(abs_url)
 
-                        # --- ADDED PATH CHECK ---
                         if (parsed_abs_url.netloc != domain or
                             abs_url in visited or
                             abs_url in processed_links or
                             parsed_abs_url.scheme not in ('http', 'https') or
-                            not abs_url.startswith(allowed_base_path)): # Check if URL starts with the allowed base path
-                            # Optional: Log why it was skipped
-                            # if parsed_abs_url.netloc == domain and not abs_url.startswith(allowed_base_path):
-                            #     print(f"[Filter]  पठान Skipping (path): {abs_url}")
+                            not abs_url.startswith(allowed_base_path)):
                             continue
-                        # -----------------------
 
                         if any(abs_url.lower().endswith(ext) for ext in ['.pdf', '.zip', '.jpg', '.png', '.gif', '.css', '.js']):
                             continue
@@ -364,20 +346,24 @@ def chunk_text_by_tokens(text, tokenizer, max_tokens):
 # --- Summarization / Extraction ---
 async def summarize_chunk(chunk, model_name, retries=3, initial_delay=5):
     """Summarizes a single chunk of text using OpenAI, with retries."""
+    # --- MODIFIED SYSTEM PROMPT - Plain Text Output ---
     sys_prompt = (
         "You are an expert technical documentation extractor. Your sole focus is "
         "to identify and extract specific technical details from the provided text. "
         "IGNORE general explanations, introductions, concepts, or narrative prose. "
         "EXTRACT ONLY the following:\n"
-        "1.  **Functions/Methods/Commands:** List their exact names.\n"
-        "2.  **Syntax/Signature:** Provide the full syntax, including parameters (with types if available), "
+        "1.  Functions/Methods/Commands: List their exact names.\n"
+        "2.  Syntax/Signature: Provide the full syntax, including parameters (with types if available), "
         "arguments, options, flags, and return types (if mentioned).\n"
-        "3.  **Purpose:** Briefly state the purpose or description of each function/method/command.\n"
-        "4.  **Code Examples:** Include any direct code examples demonstrating usage.\n\n"
-        "PRESENT the output clearly. Use Markdown formatting. Use triple backticks (```) for all code blocks, "
-        "syntax definitions, and examples. If no functions/methods/commands are found in the chunk, state 'No technical functions or syntax found in this chunk.'\n"
+        "3.  Purpose: Briefly state the purpose or description of each function/method/command.\n"
+        "4.  Code Examples: Include any direct code examples demonstrating usage.\n\n"
+        "PRESENT the output clearly as plain text. DO NOT use any Markdown formatting (like ##, **, ```). "
+        "Clearly separate function/method names, syntax, purpose, and examples using newlines. "
+        "Indent syntax definitions and code examples consistently (e.g., with 4 spaces) for clarity. "
+        "If no functions/methods/commands are found in the chunk, state 'No technical functions or syntax found in this chunk.'\n"
         "DO NOT summarize the text in a narrative way. Extract the requested details directly."
     )
+    # --------------------------------------------------
 
     delay = initial_delay
     for attempt in range(retries):
@@ -429,16 +415,18 @@ def consolidate_summaries(summaries, model_name):
 
     joined_summaries = "\n\n---\n\n".join(summaries)
 
+    # --- MODIFIED CONSOLIDATION PROMPT - Plain Text Output ---
     prompt = (
         "You are consolidating extracted technical documentation details (functions, syntax, examples) from multiple text chunks. "
-        "Your task is to merge these details into a single, coherent document.\n"
+        "Your task is to merge these details into a single, coherent plain text document.\n"
         "1.  **Combine:** Group information related to the same function/method/command together.\n"
         "2.  **De-duplicate:** Remove redundant entries or examples for the same item.\n"
-        "3.  **Structure:** Organize the information logically (e.g., alphabetically by function name, or grouped by module if possible).\n"
-        "4.  **Format:** Maintain clear Markdown formatting, especially for code blocks (```).\n"
+        "3.  **Structure:** Organize the information logically (e.g., alphabetically by function name, or grouped by module if possible). Use clear headings (plain text, perhaps followed by a line of dashes '----') for sections if helpful, but do NOT use Markdown headers (##).\n"
+        "4.  **Format:** Output as plain text only. DO NOT use any Markdown formatting (like **, ```). Use newlines and consistent indentation (e.g., 4 spaces) to structure the information clearly. Ensure syntax and code examples are indented.\n"
         "5.  **Preserve Detail:** Ensure ALL extracted technical specifications (names, syntax, parameters, purposes, examples) are preserved.\n"
-        "DO NOT add introductory sentences, narrative explanations, or summaries of the overall topic. Focus ONLY on merging the provided technical details cleanly."
+        "DO NOT add introductory sentences, narrative explanations, or summaries of the overall topic. Focus ONLY on merging the provided technical details cleanly into plain text."
     )
+    # -------------------------------------------------------
 
     try:
         resp = openai_sync.chat.completions.create(
@@ -478,10 +466,12 @@ def generate_descriptive_filename(content, url, model_name):
         potential_title = ""
         for line in first_lines:
             line = line.strip()
-            if line and len(line) > 5 and len(line) < 100:
-                 if not line.endswith(('.', '!', '?')):
-                     potential_title = line
-                     break
+            # Try to find a line that looks like a heading (no ending punctuation, reasonable length)
+            if line and len(line) > 3 and len(line) < 100 and not line.endswith(('.', '!', '?', ':', ')', ']')):
+                # Simple check for likely code/syntax lines to exclude them as titles
+                if not re.match(r'^[\s>]*[a-zA-Z0-9_]+\(.*\)', line) and not re.match(r'^[\s>]*[A-Z_]{3,}', line):
+                    potential_title = line
+                    break
         if potential_title:
             sanitized_title = re.sub(r'\s+', '_', potential_title)
             sanitized_title = re.sub(r'[^a-zA-Z0-9_]+', '', sanitized_title).lower()
@@ -645,7 +635,7 @@ if __name__ == "__main__":
         print(f"Invalid depth entered. Using default: {DEFAULT_MAX_DEPTH}")
         max_depth_val = DEFAULT_MAX_DEPTH
 
-    topic_input = input("Enter topic focus (press Enter to infer from domain): ").strip()
+    topic_input = input("Enter topic focus (e.g., 'Looker Studio Functions', press Enter to infer from domain): ").strip()
     if not topic_input:
         try:
             topic_input = urlparse(start_url_input).netloc
