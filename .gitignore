@@ -164,3 +164,8 @@ my_secrets
 *.txt
 embedding_cache.json
 .venv-info
+/output_quality/*
+/output_raw/*
+/output/*
+
+*.json

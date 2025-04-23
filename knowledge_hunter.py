@@ -1,658 +1,663 @@
-# -*- coding: utf-8 -*-
-"""
-Knowledge Hunter: Automated Documentation Extractor
+# knowledge_hunter.py
 
-Scrapes websites for technical documentation, filters relevant content using
-keywords and semantic similarity, chunks text, extracts specific technical details
-(functions, syntax) using an LLM, and compiles the results.
-"""
-import argparse # Keep argparse for potential future use or as reference
 import asyncio
-import hashlib
-import json
 import os
-import re
+import sys
 import time
-from collections import Counter
-from urllib.parse import urljoin, urlparse, urlunparse
-from pathlib import Path # Used for path manipulation
-
+import re
+import json # Added for quality assessment saving
+from urllib.parse import urlparse, unquote
+from pathlib import Path
+from typing import Optional, Dict, Any, List
 import httpx
-import numpy as np
-import tiktoken
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from openai import AsyncOpenAI, OpenAI
+import traceback
 
-# --- Configuration ---
-load_dotenv(override=True)
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_KEY:
-    raise ValueError(
-        "OPENAI_API_KEY not found. Please set it in your .env file or environment."
-    )
+# --- Import Configuration ---
+import config
 
-openai_sync = OpenAI(api_key=OPENAI_KEY)
-openai_async = AsyncOpenAI(api_key=OPENAI_KEY)
+# --- Import necessary functions ---
+from raw_scraper import crawl_site
+from content_processor import (
+    process_scraped_data,
+    clean_html_content, # Needed for cleaning during inference # [cite: 171]
+    get_embedding,
+    get_llm_response,   # <<< Needed for LLM-based inference
+    count_tokens,       # <<< Needed for truncating text for LLM
+    get_tokenizer,      # <<< Needed for count_tokens
+    async_openai_client as openai_client, # [cite: 172]
+)
+from compiler import compile_txt_files # [cite: 172]
 
-# --- Constants ---
-DEFAULT_MAX_DEPTH = 2
-FILENAME_CACHE_PATH = "filename_cache.json"
-EMBEDDING_CACHE_PATH = "embedding_cache.json"
-OUTPUT_FOLDER = "output"
-DEFAULT_MODEL = "gpt-4o"
-MODEL_CONTEXT_LIMITS = {
-    "gpt-3.5-turbo": 4096,
-    "gpt-3.5-turbo-16k": 16384, # Often deprecated
-    "gpt-4": 8192, # Often deprecated
-    "gpt-4-turbo": 128000, # Context window size for gpt-4-turbo-preview etc.
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-}
-AVAILABLE_MODELS = list(MODEL_CONTEXT_LIMITS.keys())
+# --- Constants from Config ---
+OUTPUT_DIR = config.OUTPUT_DIR # [cite: 29]
+OUTPUT_RAW_DIR = config.OUTPUT_RAW_DIR # [cite: 30]
+MAX_DEPTH = config.MAX_DEPTH # [cite: 15]
+# HIERARCHICAL CHANGE: Read chosen models potentially set during processing
+# These might be overridden later by user choice in process_scraped_data
+EXTRACTION_MODEL = config.EXTRACTION_MODEL # [cite: 18]
+CONSOLIDATION_MODEL = config.CONSOLIDATION_MODEL # [cite: 19]
+RATING_MODEL = config.RATING_MODEL # Used for topic inference LLM call & final rating # [cite: 20, 172]
+CONTENT_SEMANTIC_THRESHOLD = config.CONTENT_SEMANTIC_THRESHOLD # [cite: 25]
+CHUNK_SIZE = config.CHUNK_SIZE_TOKENS # [cite: 22]
+SKIP_COMPILATION = config.SKIP_COMPILATION # [cite: 17]
+SAVE_RAW = config.SAVE_RAW # [cite: 16]
 
-# --- Concurrency & Rate Limiting ---
-MAX_HTTP_CONCURRENCY = 5
-MAX_EMB_CONCURRENCY = 20
-MAX_SUMMARY_CONCURRENCY = 5
-http_sem = asyncio.Semaphore(MAX_HTTP_CONCURRENCY)
-emb_sem = asyncio.Semaphore(MAX_EMB_CONCURRENCY)
-summary_sem = asyncio.Semaphore(MAX_SUMMARY_CONCURRENCY)
+# IMPROVEMENT: Define Quality Assessment Output Directory
+OUTPUT_QUALITY_DIR = os.path.join(config.BASE_DIR, 'output_quality') # [cite: 29]
 
-# --- Similarity Threshold ---
-SEMANTIC_SIMILARITY_THRESHOLD = 0.35
+# --- Helper Functions ---
 
-# --- Caching ---
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+def sanitize_for_filename(text: str) -> str:
+    """Sanitizes a string for use in a filename component."""
+    if not text: return "untitled"
+    text = re.sub(r"^[a-zA-Z]+://", "", text) # [cite: 173]
+    text = re.sub(r'[\\/*?:"<>|]+', "_", text) # [cite: 173]
+    text = re.sub(r"[\s_]+", "_", text) # [cite: 173]
+    max_base_len = 100
+    return text.strip('_')[:max_base_len].lower()
 
-def load_json_cache(path):
-    """Loads a JSON cache file if it exists."""
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"[Cache] Error loading {path}: {e}. Starting with empty cache.")
-            return {}
-    return {}
+def generate_output_filename(topic: str, domain: str, extension: str = ".txt") -> str:
+    """Generates a descriptive filename for output files."""
+    sanitized_topic = sanitize_for_filename(topic)
+    sanitized_domain = sanitize_for_filename(domain.replace(':', '_')) # [cite: 174]
+    max_len = 80
+    filename_base = f"{sanitized_topic}_{sanitized_domain}"[:max_len] # [cite: 174]
+    filename_base = re.sub(r"_+", "_", filename_base).strip('_') # [cite: 174]
+    if not filename_base:
+        filename_base = f"output_{int(time.time())}" # [cite: 174]
+    return f"{filename_base}{extension}"
 
-def save_json_cache(path, cache_data):
-    """Saves data to a JSON cache file."""
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, indent=2)
-    except IOError as e:
-        print(f"[Cache] Error saving {path}: {e}")
-
-filename_cache = load_json_cache(FILENAME_CACHE_PATH)
-_emb_cache = load_json_cache(EMBEDDING_CACHE_PATH)
-
-# --- Tokenization ---
-def get_tokenizer_for_model(model_name=DEFAULT_MODEL):
-    """Gets the appropriate tokenizer for a given model."""
-    try:
-        return tiktoken.encoding_for_model(model_name)
-    except KeyError:
-        print(f"[Tokenizer] Warning: No specific tokenizer found for {model_name}. Using cl100k_base.")
-        return tiktoken.get_encoding("cl100k_base")
-
-# --- Embeddings & Similarity ---
-async def embed_text(text):
-    """Generates an embedding for the given text, using a cache."""
-    normalized_text = ' '.join(text.lower().strip().split())
-    key = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
-
-    if key in _emb_cache:
-        return _emb_cache[key]
-
-    async with emb_sem:
-        try:
-            resp = await openai_async.embeddings.create(
-                model="text-embedding-3-small",
-                input=normalized_text
-            )
-            vec = resp.data[0].embedding
-            _emb_cache[key] = vec
-            save_json_cache(EMBEDDING_CACHE_PATH, _emb_cache)
-            return vec
-        except Exception as e:
-            print(f"[Embed] Error embedding text (first 50 chars): '{normalized_text[:50]}...': {e}")
-            return None
-
-def cosine(a, b):
-    """Calculates the cosine similarity between two vectors."""
-    if a is None or b is None:
-        return 0.0
-    try:
-        a, b = np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / ((norm_a * norm_b) + 1e-9))
-    except Exception as e:
-        print(f"[Cosine] Error calculating similarity: {e}")
-        return 0.0
-
-# --- Keyword Extraction & Scoring ---
-def extract_keywords(text, top_k=20):
-    """Extracts the most common words (potential keywords) from text."""
-    try:
-        words = re.findall(r"\b[a-zA-Z0-9'-]{4,}\b", text.lower())
-        stopwords = {"the", "and", "is", "in", "it", "to", "of", "a", "for", "with", "as", "on", "that", "this"}
-        filtered_words = [word for word in words if word not in stopwords]
-        return [w for w, _ in Counter(filtered_words).most_common(top_k)]
-    except Exception as e:
-        print(f"[Keywords] Error extracting keywords: {e}")
-        return []
-
-def score_link_quick(haystack, keywords):
-    """Scores a link based on keyword presence."""
-    haystack_lower = haystack.lower()
-    score = sum(1 + haystack_lower.count(kw) // 2 for kw in keywords if kw in haystack_lower)
-    return score
-
-# --- Path Restriction Helper ---
-def get_allowed_base_path(url_str):
-    """
-    Determines the allowed base path for crawling (up to one level above the start URL's directory).
-    e.g., [https://example.com/docs/product/category/page.html](https://example.com/docs/product/category/page.html) -> [https://example.com/docs/product/](https://example.com/docs/product/)
-    e.g., [https://example.com/docs/product/](https://example.com/docs/product/) -> [https://example.com/docs/](https://example.com/docs/)
-    e.g., [https://example.com/docs/](https://example.com/docs/) -> [https://example.com/](https://example.com/)
-    """
-    parsed = urlparse(url_str)
-    p = Path(parsed.path)
-    current_dir = p.parent if p.suffix else p
-    parent_dir = current_dir.parent
-    allowed_path = str(parent_dir).replace('\\', '/')
-    if not allowed_path.endswith('/'):
-        allowed_path += '/'
-    if allowed_path == "//":
-         allowed_path = "/"
-    base_url_parts = (parsed.scheme, parsed.netloc, allowed_path, '', '', '')
-    return urlunparse(base_url_parts)
-
-# --- Web Scraping ---
-async def async_scrape_website(start_url, max_depth, topic_vec, seed_keywords):
-    """Asynchronously scrapes a website starting from start_url."""
-    visited = set()
-    content_map = {}
-    parsed_start_url = urlparse(start_url)
-    domain = parsed_start_url.netloc
-    allowed_base_path = get_allowed_base_path(start_url)
-    print(f"[Async] Restricting crawl to base path: {allowed_base_path}")
-    all_keywords = list(dict.fromkeys(seed_keywords))
-    print(f"[Async] Initial keywords: {all_keywords}")
-
-    async with httpx.AsyncClient(follow_redirects=True, http2=False, timeout=20.0) as client:
-
-        async def crawl(url, depth):
-            """Recursive crawl function."""
-            nonlocal all_keywords
-
-            if depth > max_depth or url in visited:
-                return
-            visited.add(url)
-
-            async with http_sem:
-                try:
-                    print(f"[Async] Fetching ({depth}): {url}")
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                    }
-                    resp = await client.get(url, headers=headers)
-                    resp.raise_for_status()
-                    html = resp.text
-                except httpx.RequestError as e:
-                    print(f"[Async] Network error fetching {url}: {e}")
-                    return
-                except httpx.HTTPStatusError as e:
-                    print(f"[Async] HTTP error fetching {url}: {e.response.status_code} - {e.request.url}")
-                    return
-                except Exception as e:
-                    print(f"[Async] Error fetching {url}: {e}")
-                    return
-
+# --- Fetch single URL helper (for topic inference) ---
+async def fetch_single_url_for_topic(url: str, timeout: float) -> Optional[str]:
+    """Fetches HTML for a single URL, simplified for setup."""
+    semaphore = asyncio.Semaphore(1) # Limit concurrency for setup fetch
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" # [cite: 174]
+    }
+    # Use a new client for this single request to avoid interactions with the main crawler's client state if any
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, verify=True) as session: # [cite: 175]
+        async with semaphore:
             try:
-                soup = BeautifulSoup(html, "html.parser")
-                for tag in soup(["script", "style", "header", "footer", "nav", "aside", "form"]):
-                    tag.decompose()
-                body_content = soup.body
-                content = body_content.get_text("\n", strip=True) if body_content else ""
-
-                if content:
-                    content_map[url] = re.sub(r'\n{3,}', '\n\n', content).strip()
-                    if depth == 0:
-                         extracted_kws = extract_keywords(content)
-                         all_keywords = list(dict.fromkeys(all_keywords + extracted_kws))
-                         print(f"[Async] Updated keywords from first page: {all_keywords}")
-
-            except Exception as e:
-                print(f"[Async] Error parsing {url}: {e}")
-                content_map[url] = ""
-
-
-            tasks = []
-            processed_links = set()
-            scope = soup.body or soup
-            if scope:
-                for a in scope.find_all("a", href=True):
+                response = await session.get(url, headers=headers, timeout=timeout) # [cite: 175]
+                response.raise_for_status() # Raise exception for 4xx/5xx status codes # [cite: 176]
+                content_type = response.headers.get("content-type", "").lower() # [cite: 176]
+                if "text/html" in content_type:
                     try:
-                        href = a['href']
-                        if not href or href.startswith(('#', 'javascript:', 'mailto:')):
-                            continue
-
-                        abs_url = urljoin(url, href)
-                        parsed_abs_url = urlparse(abs_url)
-
-                        if (parsed_abs_url.netloc != domain or
-                            abs_url in visited or
-                            abs_url in processed_links or
-                            parsed_abs_url.scheme not in ('http', 'https') or
-                            not abs_url.startswith(allowed_base_path)):
-                            continue
-
-                        if any(abs_url.lower().endswith(ext) for ext in ['.pdf', '.zip', '.jpg', '.png', '.gif', '.css', '.js']):
-                            continue
-
-                        processed_links.add(abs_url)
-                        anchor_text = a.get_text(" ", strip=True)[:150]
-                        haystack = f"{abs_url} {anchor_text}"
-
-                        quick_score = score_link_quick(haystack, all_keywords)
-                        passed_quick = (quick_score >= 1)
-
-                        next_depth = depth + 1
-                        sim = 0.0
-                        passed_semantic = False
-
-                        if passed_quick and next_depth <= max_depth:
-                            link_vec = await embed_text(haystack[:512])
-                            if link_vec and topic_vec:
-                                sim = cosine(topic_vec, link_vec)
-                                passed_semantic = sim >= SEMANTIC_SIMILARITY_THRESHOLD
-
-                        status_icon = "❓"
-                        if passed_quick:
-                            status_icon = "✅" if passed_semantic else "❌"
-                        print(f"[Filter] {status_icon} (d={next_depth}) q={quick_score:02d} sim={sim:.2f} → {abs_url}")
-
-                        if passed_semantic:
-                            tasks.append(crawl(abs_url, next_depth))
-
-                    except Exception as e:
-                        print(f"[Async] Error processing link {a.get('href', 'N/A')} on page {url}: {e}")
-
-
-            await asyncio.gather(*tasks)
-
-        await crawl(start_url, depth=0)
-        combined_content = "\n\n--- Page Separator ---\n\n".join(filter(None, content_map.values()))
-        return combined_content
-
-# --- Text Chunking ---
-def get_dynamic_token_chunk_size(model_name=DEFAULT_MODEL, output_buffer_tokens=1500, safety_margin=500):
-    """Calculates a dynamic chunk size based on model context limit."""
-    context_limit = MODEL_CONTEXT_LIMITS.get(model_name, 128000)
-    chunk_size = context_limit - output_buffer_tokens - safety_margin
-    return max(500, min(chunk_size, 8000))
-
-def chunk_text_by_tokens(text, tokenizer, max_tokens):
-    """Chunks text into segments with a maximum token count."""
-    if not text:
-        return []
-    tokens = tokenizer.encode(text, disallowed_special=())
-    chunks = []
-    start_idx = 0
-    while start_idx < len(tokens):
-        end_idx = min(start_idx + max_tokens, len(tokens))
-        chunk_tokens = tokens[start_idx:end_idx]
-        chunk_text = tokenizer.decode(chunk_tokens)
-        chunks.append(chunk_text.strip())
-        start_idx = end_idx
-    final_chunks = []
-    for chunk in chunks:
-        chunk_token_count = len(tokenizer.encode(chunk, disallowed_special=()))
-        if chunk_token_count > max_tokens:
-             sub_chunks = chunk.split('\n\n')
-             current_sub_chunk = ""
-             for sc in sub_chunks:
-                 sc_tokens = len(tokenizer.encode(sc, disallowed_special=()))
-                 current_sub_chunk_tokens = len(tokenizer.encode(current_sub_chunk, disallowed_special=()))
-                 if current_sub_chunk and current_sub_chunk_tokens + sc_tokens > max_tokens:
-                     final_chunks.append(current_sub_chunk)
-                     current_sub_chunk = ""
-                 if sc_tokens > max_tokens:
-                     if current_sub_chunk:
-                         final_chunks.append(current_sub_chunk)
-                         current_sub_chunk = ""
-                     sc_encoded = tokenizer.encode(sc, disallowed_special=())
-                     for i in range(0, len(sc_encoded), max_tokens):
-                         final_chunks.append(tokenizer.decode(sc_encoded[i:i+max_tokens]))
-                 elif current_sub_chunk_tokens + sc_tokens <= max_tokens:
-                     current_sub_chunk += ("\n\n" + sc) if current_sub_chunk else sc
-                 else:
-                     final_chunks.append(current_sub_chunk)
-                     current_sub_chunk = sc
-             if current_sub_chunk:
-                 final_chunks.append(current_sub_chunk)
-        elif chunk:
-            final_chunks.append(chunk)
-    return [c for c in final_chunks if c]
-
-
-# --- Summarization / Extraction ---
-async def summarize_chunk(chunk, model_name, retries=3, initial_delay=5):
-    """Summarizes a single chunk of text using OpenAI, with retries."""
-    # --- MODIFIED SYSTEM PROMPT - Plain Text Output ---
-    sys_prompt = (
-        "You are an expert technical documentation extractor. Your sole focus is "
-        "to identify and extract specific technical details from the provided text. "
-        "IGNORE general explanations, introductions, concepts, or narrative prose. "
-        "EXTRACT ONLY the following:\n"
-        "1.  Functions/Methods/Commands: List their exact names.\n"
-        "2.  Syntax/Signature: Provide the full syntax, including parameters (with types if available), "
-        "arguments, options, flags, and return types (if mentioned).\n"
-        "3.  Purpose: Briefly state the purpose or description of each function/method/command.\n"
-        "4.  Code Examples: Include any direct code examples demonstrating usage.\n\n"
-        "PRESENT the output clearly as plain text. DO NOT use any Markdown formatting (like ##, **, ```). "
-        "Clearly separate function/method names, syntax, purpose, and examples using newlines. "
-        "Indent syntax definitions and code examples consistently (e.g., with 4 spaces) for clarity. "
-        "If no functions/methods/commands are found in the chunk, state 'No technical functions or syntax found in this chunk.'\n"
-        "DO NOT summarize the text in a narrative way. Extract the requested details directly."
-    )
-    # --------------------------------------------------
-
-    delay = initial_delay
-    for attempt in range(retries):
-        try:
-            async with summary_sem:
-                resp = await openai_async.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": chunk}
-                    ],
-                    temperature=0.0,
-                    max_tokens=2000,
-                    n=1,
-                    stop=None,
-                )
-            summary = resp.choices[0].message.content.strip()
-            if summary and "No technical functions" not in summary:
-                 return summary
-            elif "No technical functions" in summary:
-                 print("[Summarize] Chunk contained no technical details.")
-                 return None
-            else:
-                 print(f"[Summarize] Warning: Received potentially empty summary for chunk starting with: {chunk[:50]}...")
-                 return summary
-        except Exception as e:
-            print(f"[Summarize] Error on attempt {attempt + 1}/{retries}: {e}")
-            if attempt < retries - 1:
-                print(f"[Retry] Waiting {delay}s before retrying summarization...")
-                await asyncio.sleep(delay)
-                delay *= 1.5
-            else:
-                print(f"[Summarize] Failed to summarize chunk after {retries} attempts: {chunk[:100]}...")
+                        return response.text # [cite: 176]
+                    except UnicodeDecodeError: # [cite: 177]
+                        print(f"[Setup Fetch Warning] Unicode decode error for {url}, trying utf-8 ignore.") # [cite: 177]
+                        # Use response.content which holds the raw bytes
+                        return response.content.decode('utf-8', 'ignore') # [cite: 177]
+                else:
+                    # print(f"[Setup Fetch Info] Non-HTML content type '{content_type}' for {url}")
+                    return None # Return None for non-HTML content # [cite: 178]
+            except httpx.TimeoutException:
+                print(f"[Setup Fetch Error] Timeout fetching {url} after {timeout}s") # [cite: 178]
+                return None
+            except httpx.RequestError as e:
+                # Catch broader request errors (DNS, connection refused, etc.)
+                print(f"[Setup Fetch Error] Failed to fetch {url} for topic analysis: {type(e).__name__}") # [cite: 179]
+                return None
+            except httpx.HTTPStatusError as e: # [cite: 180]
+                # Catch 4xx/5xx errors
+                print(f"[Setup Fetch Error] HTTP error {e.response.status_code} fetching {url}") # [cite: 180]
+                return None
+            except Exception as e: # [cite: 180]
+                # Catch any other unexpected errors during fetch
+                print(f"[Setup Fetch Error] Unexpected error fetching {url}: {type(e).__name__}") # [cite: 181]
+                traceback.print_exc() # Print traceback for unexpected errors # [cite: 181]
                 return None
 
-async def summarize_all_chunks(chunks, model_name):
-    """Summarizes a list of text chunks concurrently."""
-    tasks = [summarize_chunk(chunk, model_name) for chunk in chunks]
-    results = await asyncio.gather(*tasks)
-    return [summary for summary in results if summary]
-
-# --- Consolidation ---
-def consolidate_summaries(summaries, model_name):
-    """Consolidates multiple summaries into a single document."""
-    if not summaries:
-        return "No relevant technical information extracted."
-    if len(summaries) == 1:
-        return summaries[0]
-
-    joined_summaries = "\n\n---\n\n".join(summaries)
-
-    # --- MODIFIED CONSOLIDATION PROMPT - Plain Text Output ---
-    prompt = (
-        "You are consolidating extracted technical documentation details (functions, syntax, examples) from multiple text chunks. "
-        "Your task is to merge these details into a single, coherent plain text document.\n"
-        "1.  **Combine:** Group information related to the same function/method/command together.\n"
-        "2.  **De-duplicate:** Remove redundant entries or examples for the same item.\n"
-        "3.  **Structure:** Organize the information logically (e.g., alphabetically by function name, or grouped by module if possible). Use clear headings (plain text, perhaps followed by a line of dashes '----') for sections if helpful, but do NOT use Markdown headers (##).\n"
-        "4.  **Format:** Output as plain text only. DO NOT use any Markdown formatting (like **, ```). Use newlines and consistent indentation (e.g., 4 spaces) to structure the information clearly. Ensure syntax and code examples are indented.\n"
-        "5.  **Preserve Detail:** Ensure ALL extracted technical specifications (names, syntax, parameters, purposes, examples) are preserved.\n"
-        "DO NOT add introductory sentences, narrative explanations, or summaries of the overall topic. Focus ONLY on merging the provided technical details cleanly into plain text."
-    )
-    # -------------------------------------------------------
+# --- Topic Inference Helper ---
+async def infer_topic_from_url(start_url: str) -> Optional[str]: # [cite: 181]
+    """
+    Attempts to infer a topic focus using LLM analysis of content,
+    falling back to H1/Title/Path, then URL structure.
+    """ # [cite: 182]
+    print(f"[Setup] Attempting to infer topic from: {start_url}...") # [cite: 183]
+    inferred_topic: Optional[str] = None
+    domain: Optional[str] = None
+    parsed_url: Optional[Any] = None # Use Any to avoid potential urlparse typing issues across versions # [cite: 183]
 
     try:
-        resp = openai_sync.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": joined_summaries}
-            ],
-            temperature=0.0,
-            max_tokens=4000,
-        )
-        consolidated = resp.choices[0].message.content.strip()
-        return consolidated if consolidated else joined_summaries
-    except Exception as e:
-        print(f"[Consolidate] Error consolidating summaries: {e}")
-        print("[Consolidate] Returning un-consolidated summaries.")
-        return joined_summaries
-
-# --- Filename Generation ---
-def make_cache_key(url):
-    """Creates a cache key for a URL."""
-    parsed = urlparse(url)
-    normalized_url = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}{parsed.query}{parsed.fragment}"
-    return hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
-
-def generate_descriptive_filename(content, url, model_name):
-    """Generates a descriptive filename based on content and URL."""
-    key = make_cache_key(url)
-    if key in filename_cache:
-        return filename_cache[key]
-
-    domain = urlparse(url).netloc.lower()
-    safe_domain = re.sub(r'[^a-z0-9_.-]+', '', domain)
-
-    try:
-        first_lines = content.strip().split('\n', 5)[:5]
-        potential_title = ""
-        for line in first_lines:
-            line = line.strip()
-            # Try to find a line that looks like a heading (no ending punctuation, reasonable length)
-            if line and len(line) > 3 and len(line) < 100 and not line.endswith(('.', '!', '?', ':', ')', ']')):
-                # Simple check for likely code/syntax lines to exclude them as titles
-                if not re.match(r'^[\s>]*[a-zA-Z0-9_]+\(.*\)', line) and not re.match(r'^[\s>]*[A-Z_]{3,}', line):
-                    potential_title = line
-                    break
-        if potential_title:
-            sanitized_title = re.sub(r'\s+', '_', potential_title)
-            sanitized_title = re.sub(r'[^a-zA-Z0-9_]+', '', sanitized_title).lower()
-            filename_base = "_".join(sanitized_title.split('_')[:5])
-            if filename_base:
-                filename = f"{filename_base}_{safe_domain}"
-                filename_cache[key] = filename
-                save_json_cache(FILENAME_CACHE_PATH, filename_cache)
-                print(f"[Filename] Generated filename (rule-based): {filename}")
-                return filename
-    except Exception as e:
-        print(f"[Filename] Error in rule-based filename generation: {e}. Falling back to LLM.")
-
-    prompt = f"""Generate a concise, descriptive filename (3-5 lowercase words, separated by underscores, no extension) based on the primary topic of the following technical documentation content scraped from {url}. Focus on the core subject (e.g., 'api_reference', 'function_syntax', 'database_connection').
-
-Content sample:
-{content[:2500]}"""
-
-    try:
-        print("[Filename] Using LLM to generate filename.")
-        resp = openai_sync.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You generate concise, descriptive filenames (3-5 words, lowercase, underscores)."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=20,
-        )
-        filename_base = resp.choices[0].message.content.strip()
-        filename_base = re.sub(r'\s+', '_', filename_base)
-        filename_base = re.sub(r'[^a-z0-9_]+', '', filename_base).lower()
-        filename_base = "_".join(filename_base.split('_')[:5])
-
-        if not filename_base:
-            raise ValueError("LLM returned empty filename base")
-        filename = f"{filename_base}_{safe_domain}"
-    except Exception as e:
-        print(f"[Filename] LLM filename generation failed: {e}. Using generic filename.")
-        timestamp = int(time.time())
-        filename = f"doc_extract_{safe_domain}_{timestamp}"
-
-    filename_cache[key] = filename
-    save_json_cache(FILENAME_CACHE_PATH, filename_cache)
-    print(f"[Filename] Generated filename: {filename}")
-    return filename
-
-# --- Main Execution ---
-async def run_knowledge_hunter(start_url, max_depth, topic_text, model_name=DEFAULT_MODEL):
-    """Main orchestration function."""
-    if not start_url:
-        print("Error: Start URL cannot be empty.")
-        return
-
-    print(f"[Main] Starting Knowledge Hunter for URL: {start_url}")
-    print(f"[Main] Topic: '{topic_text}', Max Depth: {max_depth}, Model: {model_name}")
-
-    print("[Main] Generating topic embedding...")
-    topic_vec = await embed_text(topic_text)
-    if topic_vec is None:
-        print("[Main] Error: Failed to generate topic embedding. Cannot proceed.")
-        return
-
-    seed_keywords = [w.strip().lower() for w in topic_text.split() if len(w) > 3]
-    print(f"[Main] Initial keywords from topic: {seed_keywords}")
-
-    print(f"[Main] Starting crawl from: {start_url}...")
-    start_time = time.time()
-    all_text = await async_scrape_website(
-        start_url,
-        max_depth=max_depth,
-        topic_vec=topic_vec,
-        seed_keywords=seed_keywords
-    )
-    crawl_time = time.time() - start_time
-    print(f"[Main] Crawling completed in {crawl_time:.2f} seconds.")
-
-    if not all_text or not all_text.strip():
-        print("[Main] No relevant content scraped after filtering. Exiting.")
-        return
-
-    print(f"[Main] Total scraped text length: {len(all_text)} characters.")
-
-    print("[Main] Chunking scraped text...")
-    tokenizer = get_tokenizer_for_model(model_name)
-    chunk_size = get_dynamic_token_chunk_size(model_name)
-    print(f"[Main] Using chunk size: {chunk_size} tokens")
-    chunks = chunk_text_by_tokens(all_text, tokenizer, max_tokens=chunk_size)
-    print(f"[Main] Created {len(chunks)} chunks.")
-
-    if not chunks:
-        print("[Main] No text chunks generated. Exiting.")
-        return
-
-    print(f"[Main] Extracting technical details from {len(chunks)} chunks using {model_name}...")
-    start_time = time.time()
-    summaries = await summarize_all_chunks(chunks, model_name)
-    summary_time = time.time() - start_time
-    print(f"[Main] Extraction completed in {summary_time:.2f} seconds.")
-    print(f"[Main] Successfully extracted details from {len(summaries)} chunks.")
-
-    if not summaries:
-        print("[Main] No technical details could be extracted from the scraped content. Exiting.")
-        return
-
-    print("[Main] Consolidating extracted details...")
-    start_time = time.time()
-    final_summary = consolidate_summaries(summaries, model_name)
-    consolidation_time = time.time() - start_time
-    print(f"[Main] Consolidation completed in {consolidation_time:.2f} seconds.")
-
-    print("[Main] Generating filename and saving output...")
-    filename_content_sample = final_summary[:500]
-    output_filename_base = generate_descriptive_filename(filename_content_sample, start_url, model_name)
-    output_path = os.path.join(OUTPUT_FOLDER, f"{output_filename_base}.txt")
-
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(f"Source URL: {start_url}\n")
-            f.write(f"Topic Focus: {topic_text}\n")
-            f.write(f"Max Depth: {max_depth}\n")
-            f.write(f"Model Used: {model_name}\n")
-            f.write(f"Similarity Threshold: {SEMANTIC_SIMILARITY_THRESHOLD}\n")
-            f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*80 + "\n\n")
-            f.write(final_summary)
-        print(f"[Main] Final documentation saved to: {output_path}")
-    except IOError as e:
-        print(f"[Main] Error saving final output to {output_path}: {e}")
-
-    try:
-        compiler_path = os.path.join(os.path.dirname(__file__), 'compiler.py')
-        if os.path.exists(compiler_path):
-            import compiler
-            print("[Main] Compiling all .txt files in output folder...")
-            compiler.compile_txt_files()
-        else:
-            print("[Main] compiler.py not found, skipping compilation.")
-    except ImportError:
-        print("[Main] Could not import compiler module. Ensure compiler.py is present.")
-    except Exception as e:
-        print(f"[Main] Failed to run compiler: {e}")
-
-    print("[Main] Saving caches...")
-    save_json_cache(FILENAME_CACHE_PATH, filename_cache)
-    save_json_cache(EMBEDDING_CACHE_PATH, _emb_cache)
-    print("[Main] Knowledge Hunter finished.")
-
-
-if __name__ == "__main__":
-    start_url_input = ""
-    while not start_url_input:
-        start_url_input = input("Enter the Start URL to scrape: ").strip()
-        if not start_url_input:
-            print("URL cannot be empty.")
-
-    max_depth_input = input(f"Enter max crawl depth (default: {DEFAULT_MAX_DEPTH}): ").strip()
-    try:
-        max_depth_val = int(max_depth_input) if max_depth_input else DEFAULT_MAX_DEPTH
+        parsed_url = urlparse(start_url)
+        domain = parsed_url.netloc
+        if not domain:
+             print("[Setup] Warning: Could not parse domain from start URL.") # [cite: 183]
+             return None
     except ValueError:
-        print(f"Invalid depth entered. Using default: {DEFAULT_MAX_DEPTH}")
-        max_depth_val = DEFAULT_MAX_DEPTH
+         print("[Setup] Warning: Invalid start URL format.") # [cite: 184]
+         return None
 
-    topic_input = input("Enter topic focus (e.g., 'Looker Studio Functions', press Enter to infer from domain): ").strip()
-    if not topic_input:
+    # --- Attempt 1: LLM Inference from Content ---
+    html_content = await fetch_single_url_for_topic(start_url, config.REQUEST_TIMEOUT) # [cite: 184]
+    if html_content and openai_client: # Check if client is available
+        print("[Setup] Analyzing page content with LLM for topic inference...")
+        cleaned_text = clean_html_content(html_content) # [cite: 184]
+        if cleaned_text: # [cite: 185]
+            # Truncate cleaned text to avoid excessive token usage for inference
+            max_inference_tokens = 1500 # Adjust as needed
+            tokenizer = get_tokenizer()
+            token_count = count_tokens(cleaned_text, tokenizer) # [cite: 185]
+
+            if token_count > max_inference_tokens:
+                if tokenizer: # [cite: 185]
+                    encoded = tokenizer.encode(cleaned_text, disallowed_special=()) # Allow all special tokens for count # [cite: 186]
+                    truncated_text = tokenizer.decode(encoded[:max_inference_tokens]) # [cite: 186]
+                else: # Fallback if tokenizer failed
+                    truncated_text = cleaned_text[:max_inference_tokens * 4] # Rough estimate # [cite: 186]
+                print(f"[Setup Debug] Truncated content for LLM inference ({max_inference_tokens} tokens).") # [cite: 187]
+            else:
+                truncated_text = cleaned_text
+
+            system_message = "You are a helpful assistant specialized in analyzing web page content." # [cite: 187]
+            prompt = f"""Analyze the beginning of the text content from the webpage: {start_url}
+
+Content Snippet:
+\"\"\"
+{truncated_text}
+\"\"\"
+
+Based *only* on the provided snippet, what is the primary subject or topic of this documentation page?
+Respond with ONLY a concise, descriptive topic title (ideally 3-7 words). Do not add explanations.
+Example output: "Using Asyncio Streams" or "LangChain Agent Configuration"
+
+Topic Title:""" # [cite: 187, 188, 189, 190]
+
+            try:
+                # Use the cheaper/faster RATING_MODEL for this setup task
+                # *** TYPEERROR FIX: Use max_tokens_completion instead of max_tokens ***
+                llm_topic = await get_llm_response(
+                    prompt=prompt, # [cite: 190]
+                    system_message=system_message,
+                    model=config.RATING_MODEL, # Use RATING_MODEL from config # [cite: 191]
+                    temperature=0.1,
+                    max_tokens_completion=50 # Corrected parameter name # [cite: 191]
+                )
+
+                if llm_topic and isinstance(llm_topic, str) and 3 < len(llm_topic) < 100: # Basic validation # [cite: 192]
+                    # Further clean potential LLM artifacts like quotes
+                    llm_topic = llm_topic.strip().strip('"').strip("'").strip() # [cite: 192]
+                    if llm_topic: # [cite: 192]
+                        inferred_topic = llm_topic # [cite: 193]
+                        print(f"[Setup] Inferred topic from LLM analysis: '{inferred_topic}'") # [cite: 193]
+                # elif llm_topic: # Log if response was received but invalid
+                #     print(f"[Setup Debug] LLM response for topic invalid: '{llm_topic[:100]}...'") # [cite: 193]
+
+
+            except Exception as llm_err:
+                 # Print the actual error type and message
+                 print(f"[Setup] LLM topic inference failed: {type(llm_err).__name__}") # [cite: 194]
+                 # Optionally print traceback for debugging # [cite: 195]
+                 # traceback.print_exc()
+                 # Proceed to fallback methods
+        else:
+            print("[Setup] Content cleaned to empty, skipping LLM inference.") # [cite: 195]
+    elif html_content and not openai_client:
+        print("[Setup] OpenAI client not available, skipping LLM inference.") # [cite: 195]
+    # --- End Attempt 1 --- # [cite: 195]
+
+    # --- Attempt 2: Fallback to H1 / Title / Path ---
+    if not inferred_topic and html_content: # [cite: 196]
+        print("[Setup] Falling back to H1/Title/Path inference...")
+        title_text: Optional[str] = None
+        h1_text: Optional[str] = None
+        path_text: Optional[str] = None
         try:
-            topic_input = urlparse(start_url_input).netloc
-            print(f"Inferring topic from domain: {topic_input}")
-        except Exception:
-             print("Could not infer topic from URL. Please provide a topic next time.")
-             topic_input = "documentation"
+            soup = BeautifulSoup(html_content, "html.parser") # [cite: 196]
+            # Extract Title
+            title_tag = soup.find('title') # [cite: 197]
+            if title_tag and title_tag.string:
+                raw_title = title_tag.string.strip() # [cite: 197]
+                # Try to remove common site names or separators at the end
+                cleaned_title = re.sub(r'\s*([|-]|at|by)\s*([\w\s.-]+)$', '', raw_title, flags=re.IGNORECASE).strip() # [cite: 197]
+                # If cleaning didn't change much or made it empty, try splitting
+                if not cleaned_title or len(cleaned_title) > len(raw_title) - 2: # [cite: 198]
+                    cleaned_title = re.split(r'[|-]', raw_title)[0].strip() # [cite: 198]
+                if len(cleaned_title) > 3: title_text = cleaned_title # [cite: 198]
+            # Extract H1
+            h1_tag = soup.find('h1') # [cite: 199]
+            if h1_tag:
+                # Get text content, joining strings if multiple elements inside H1
+                raw_h1 = ' '.join(h1_tag.stripped_strings) # [cite: 199]
+                if raw_h1 and len(raw_h1) > 3: h1_text = raw_h1 # [cite: 199]
+        except Exception as parse_e:
+            print(f"[Setup] Error parsing H1/Title: {parse_e}") # [cite: 200]
 
-    print(f"\nAvailable models: {', '.join(AVAILABLE_MODELS)}")
-    model_input = input(f"Enter model name (default: {DEFAULT_MODEL}): ").strip()
-    if not model_input or model_input not in AVAILABLE_MODELS:
-        print(f"Using default model: {DEFAULT_MODEL}")
-        model_input = DEFAULT_MODEL
+        # Extract Path (can run even if HTML parsing failed)
+        if parsed_url and parsed_url.path and parsed_url.path != '/': # [cite: 200]
+            try:
+                # Decode URL-encoded characters in path, strip slashes, split # [cite: 200]
+                path_parts = unquote(parsed_url.path).strip('/').split('/') # [cite: 201]
+                # Filter out common/generic terms and very short parts
+                generic_terms = {'docs', 'documentation', 'api', 'reference', 'guide', # [cite: 201]
+                                 'how-to', 'concepts', 'tutorials', 'index', 'html', 'htm', ''} # [cite: 201]
+                meaningful_parts = [part.replace('-', ' ').replace('_', ' ')
+                                    for part in path_parts
+                                    if part.lower() not in generic_terms and len(part) > 2] # [cite: 202]
+                if meaningful_parts: # [cite: 203]
+                     # Join remaining parts and title-case them
+                     path_text = ' '.join(meaningful_parts).title() # [cite: 203]
+            except Exception as path_e:
+                 print(f"[Setup] Error parsing path: {path_e}") # [cite: 203]
 
-    asyncio.run(run_knowledge_hunter(
-        start_url=start_url_input,
-        max_depth=max_depth_val,
-        topic_text=topic_input,
-        model_name=model_input
-    ))
+        # Combine H1/Title/Path, prioritizing H1, then Title, then Path
+        topic_parts = []
+        added_texts_lower = set() # Keep track to avoid duplicates
+
+        if h1_text:
+            topic_parts.append(h1_text) # [cite: 204]
+            added_texts_lower.add(h1_text.lower())
+        if title_text and title_text.lower() not in added_texts_lower: # [cite: 205]
+            topic_parts.append(title_text) # [cite: 205]
+            added_texts_lower.add(title_text.lower())
+        if path_text and path_text.lower() not in added_texts_lower: # [cite: 205]
+            topic_parts.append(path_text)
+            # No need to add path_text to added_texts_lower as it's the last one checked
+
+        if topic_parts:
+            # Join with ' - ' and remove potential duplicate words from joining # [cite: 205]
+            combined_topic = ' - '.join(topic_parts) # [cite: 206]
+            # A simple way to remove duplicates while preserving order-ish
+            combined_topic = ' '.join(dict.fromkeys(combined_topic.split())) # [cite: 206]
+
+            if len(combined_topic) > 5: # Ensure it's reasonably long
+                 inferred_topic = combined_topic # [cite: 206]
+                 print(f"[Setup] Inferred topic from H1/Title/Path: '{inferred_topic}'") # [cite: 207]
+    # --- End Attempt 2 ---
+
+
+    # --- Attempt 3: Fallback to URL Structure ---
+    if not inferred_topic and domain: # [cite: 207]
+        print("[Setup] Falling back to URL structure inference.")
+        try:
+            domain_parts = domain.split('.')
+            # Common subdomains or TLDs to ignore if they are the *only* part left # [cite: 207]
+            common_subdomains = {'www', 'docs', 'dev', 'ai', 'developer', 'support', 'help', 'app', 'cloud', 'blog', 'info', 'com', 'org', 'net', 'io'} # [cite: 208]
+            # Try using the part before the TLD first (e.g., 'google' from 'google.com')
+            if len(domain_parts) >= 2 and domain_parts[-2].lower() not in common_subdomains: # [cite: 208]
+                inferred_topic = domain_parts[-2].replace('-', ' ').title() # [cite: 209]
+            # If that didn't work, try the first part if it's not common
+            elif len(domain_parts) > 1 and domain_parts[0].lower() not in common_subdomains: # [cite: 209]
+                 inferred_topic = domain_parts[0].replace('-', ' ').title() # [cite: 209]
+            # Fallback to the whole domain if parts were too generic
+            elif domain: # [cite: 209]
+                 inferred_topic = domain.split('.')[0].replace('-', ' ').title() # Just take first part # [cite: 210]
+
+            if inferred_topic:
+                print(f"[Setup] Inferred topic from URL structure: '{inferred_topic}'") # [cite: 210]
+            else:
+                print("[Setup] Could not infer topic from URL structure.") # [cite: 210]
+        except Exception as e:
+             print(f"[Setup] Error during URL structure inference: {e}") # [cite: 211]
+
+    # --- End Attempt 3 ---
+
+    if not inferred_topic:
+         print("[Setup] Failed to infer topic through all methods.") # [cite: 211]
+
+    return inferred_topic
+# --- END Topic Inference Helper ---
+
+
+# --- Main Orchestration ---
+async def main(start_url: str, topic_focus: str):
+    """Main async function to run the knowledge hunter pipeline."""
+    start_time = time.perf_counter() # [cite: 211]
+    print(f"\n[Main] Starting Knowledge Hunter at {time.strftime('%Y-%m-%d %H:%M:%S')}") # [cite: 212]
+    print("-" * 40)
+
+    # Ensure output directories exist
+    try:
+        if SAVE_RAW:
+            Path(OUTPUT_RAW_DIR).mkdir(parents=True, exist_ok=True) # [cite: 212]
+            print(f"[Main] Ensured raw output directory exists: {os.path.abspath(OUTPUT_RAW_DIR)}") # [cite: 212]
+        Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True) # [cite: 212]
+        print(f"[Main] Ensured processed output directory exists: {os.path.abspath(OUTPUT_DIR)}") # [cite: 212]
+        # IMPROVEMENT: Ensure quality assessment directory exists
+        Path(OUTPUT_QUALITY_DIR).mkdir(parents=True, exist_ok=True)
+        print(f"[Main] Ensured quality assessment directory exists: {os.path.abspath(OUTPUT_QUALITY_DIR)}")
+    except OSError as e: # [cite: 212]
+        print(f"[Main] Error creating output directories: {e}. Exiting.") # [cite: 213]
+        traceback.print_exc() # [cite: 214]
+        return
+
+    # Calculate Domain
+    try:
+        parsed_url = urlparse(start_url) # [cite: 214]
+        domain = parsed_url.netloc
+        if not domain:
+             raise ValueError("Could not parse domain from start URL.") # [cite: 214]
+    except ValueError as e:
+         print(f"[Main] Error: Invalid start URL '{start_url}': {e}. Exiting.") # [cite: 214]
+         return # [cite: 215]
+    except Exception as e:
+        print(f"[Main] Error parsing URL '{start_url}': {type(e).__name__} - {e}. Exiting.") # [cite: 215]
+        traceback.print_exc() # [cite: 215]
+        return
+
+    print(f"[Main] Using Topic Focus: '{topic_focus}'")
+
+    # Log Configuration
+    print("[Main] Using Configuration from config.py:") # [cite: 215]
+    print(f"  - Start URL: {start_url}")
+    print(f"  - Topic Focus: '{topic_focus}'")
+    print(f"  - Domain: {domain}")
+    print("-" * 20) # [cite: 215]
+    print("  Scraping Config:") # [cite: 216]
+    print(f"  - Max Depth: {MAX_DEPTH}") # [cite: 216]
+    print(f"  - Concurrent Requests: {config.CONCURRENT_REQUEST_LIMIT}") # [cite: 216]
+    print(f"  - Request Timeout: {config.REQUEST_TIMEOUT}s") # [cite: 216]
+    print("-" * 20)
+    print("  Content Filtering Config:") # [cite: 216]
+    sem_thresh_str = 'Disabled' if CONTENT_SEMANTIC_THRESHOLD > 1.0 else f"{CONTENT_SEMANTIC_THRESHOLD:.2f}" # [cite: 216]
+    print(f"  - Content Semantic Threshold: {sem_thresh_str}") # [cite: 216]
+    print(f"  - Embedding Model: {config.EMBEDDING_MODEL}") # [cite: 216]
+    print("-" * 20)
+    print("  Processing Config:") # [cite: 216]
+    # Use the actual models configured, potentially overridden later # [cite: 216]
+    print(f"  - Extraction Model: {EXTRACTION_MODEL}") # [cite: 217]
+    print(f"  - Consolidation Model: {CONSOLIDATION_MODEL}") # [cite: 217]
+    print(f"  - Rating Model: {RATING_MODEL}") # [cite: 217]
+    print(f"  - Chunk Size (Tokens): {CHUNK_SIZE}") # [cite: 217]
+    print(f"  - LLM Concurrency Limit: {config.LLM_CONCURRENCY_LIMIT}") # [cite: 217]
+    print("-" * 20)
+    print("  Output Config:") # [cite: 217]
+    print(f"  - Output Directory (Processed): {os.path.abspath(OUTPUT_DIR)}") # [cite: 217]
+    print(f"  - Save Raw HTML: {SAVE_RAW}") # [cite: 217]
+    if SAVE_RAW:
+        print(f"  - Output Directory (Raw): {os.path.abspath(OUTPUT_RAW_DIR)}") # [cite: 217]
+    # IMPROVEMENT: Log quality assessment dir
+    print(f"  - Output Directory (Quality Assess): {os.path.abspath(OUTPUT_QUALITY_DIR)}")
+    print(f"  - Skip Compilation: {SKIP_COMPILATION}") # [cite: 218]
+    compiled_output_file_path = config.DEFAULT_COMPILED_OUTPUT_FILE # Use the configured default # [cite: 218]
+    if not SKIP_COMPILATION:
+        print(f"  - Compiled Output File: {os.path.abspath(compiled_output_file_path)}") # [cite: 218]
+    print("-" * 40)
+
+    # Initial Setup: Embeddings
+    topic_embedding: Optional[List[float]] = None
+    scraped_data: Dict[str, Dict[str, Any]] = {}
+
+    openai_client_available = bool(openai_client) # [cite: 218]
+    if not openai_client_available:
+         print("[Setup] Warning: OpenAI client not initialized. LLM features disabled.") # [cite: 218]
+         print("[Setup] Content semantic filtering and processing will be skipped.") # [cite: 219]
+
+    content_semantic_enabled = CONTENT_SEMANTIC_THRESHOLD <= 1.0 # [cite: 219]
+    need_embedding = content_semantic_enabled and topic_focus and openai_client_available # [cite: 219]
+
+    if need_embedding:
+        try:
+            print(f"[Setup] Generating embedding for topic '{topic_focus}' (for content filtering)...") # [cite: 219]
+            topic_embedding = await get_embedding(topic_focus, model=config.EMBEDDING_MODEL) # [cite: 219]
+            if topic_embedding:
+                 print("[Setup] Topic embedding generated successfully.") # [cite: 219]
+            else:
+                print("[Setup] Warning: Failed to generate topic embedding. Semantic filtering disabled.") # [cite: 220]
+                content_semantic_enabled = False
+        except Exception as e:
+            print(f"[Setup] Error generating topic embedding: {type(e).__name__}. Semantic filtering disabled.") # [cite: 220]
+            traceback.print_exc() # [cite: 221]
+            topic_embedding = None
+            content_semantic_enabled = False
+    elif content_semantic_enabled and not topic_focus:
+         print("[Setup] Warning: Semantic filtering enabled but no topic focus provided. Disabling semantic filter.") # [cite: 221]
+         content_semantic_enabled = False # [cite: 222]
+    elif content_semantic_enabled and not openai_client_available:
+         print("[Setup] Warning: Semantic filtering enabled but OpenAI client unavailable. Disabling semantic filter.") # [cite: 222]
+         content_semantic_enabled = False
+    elif not content_semantic_enabled:
+        print(f"[Setup] Skipping embedding generation: Content semantic threshold ({CONTENT_SEMANTIC_THRESHOLD}) > 1.0.") # [cite: 222]
+
+
+    # --- Crawling ---
+    print("-" * 40)
+    print(f"[Main] Starting crawl from: {start_url}...") # [cite: 222]
+    try: # [cite: 223]
+        crawl_start_time = time.perf_counter() # [cite: 223]
+        scraped_data = await crawl_site(
+            start_url=start_url,
+            max_depth=MAX_DEPTH,
+            topic_embedding=topic_embedding if content_semantic_enabled else None # [cite: 223]
+            # Pass other necessary config if crawl_site needs them
+        )
+        crawl_duration = time.perf_counter() - crawl_start_time # [cite: 223]
+        print(f"[Main] Crawling completed in {crawl_duration:.2f} seconds.") # [cite: 224]
+    except KeyboardInterrupt:
+        print("\n[Main] Crawl interrupted by user.") # [cite: 224]
+        if not scraped_data:
+            print("[Main] No data collected before interruption. Exiting.") # [cite: 224]
+            return # [cite: 225]
+        print("[Main] Proceeding to process partially collected data...") # [cite: 225]
+    except Exception as e:
+        print(f"[Main] Error during crawling: {type(e).__name__} - {e}") # [cite: 225]
+        traceback.print_exc()
+        if not scraped_data:
+            print("[Main] No data collected due to crawling error. Exiting.") # [cite: 225]
+            return
+        print("[Main] Proceeding to process potentially partial data due to crawling error...") # [cite: 226]
+
+    # --- Processing ---
+    print("-" * 40)
+    consolidated_text : Optional[str] = None
+    quality_rating : Optional[Dict[str, Any]] = None
+
+    if not scraped_data:
+        print("[Main] No pages available for processing.") # [cite: 226]
+    elif not openai_client_available:
+         print("[Main] Skipping content processing: OpenAI client unavailable.") # [cite: 226]
+    else:
+        print(f"[Main] Starting content processing for {len(scraped_data)} pages...") # [cite: 226]
+        try:
+            process_start_time = time.perf_counter() # [cite: 227]
+            # process_scraped_data now returns chosen models if user selected them
+            consolidated_text, quality_rating = await process_scraped_data(
+                scraped_data=scraped_data,
+                topic=topic_focus # [cite: 227]
+                # Pass chosen_extraction_model, chosen_consolidation_model if needed # [cite: 228]
+            )
+            process_duration = time.perf_counter() - process_start_time # [cite: 228]
+            print(f"[Main] Content processing finished in {process_duration:.2f} seconds.") # [cite: 228]
+        except Exception as e:
+            print(f"[Main] Error during content processing: {type(e).__name__} - {e}") # [cite: 228]
+            traceback.print_exc() # [cite: 229]
+
+    # --- Saving Output ---
+    print("-" * 40)
+    # Determine which models were actually used (read from config again,
+    # as process_scraped_data might modify selections internally but doesn't return them)
+    # In a more complex setup, process_scraped_data might return used model names.
+    final_extraction_model = config.EXTRACTION_MODEL # Assume default unless changed # [cite: 229]
+    final_consolidation_model = config.CONSOLIDATION_MODEL # Assume default unless changed # [cite: 230]
+
+    if consolidated_text:
+        # Use the config value for the final output file
+        # output_filepath = os.path.abspath(config.DEFAULT_COMPILED_OUTPUT_FILE) # Original approach targeted compiler
+        # Generate a *processed* filename based on topic/domain for the individual file if needed,
+        # but the primary output seems intended for DEFAULT_COMPILED_OUTPUT_FILE potentially via compiler. # [cite: 230]
+        # Let's save the consolidated output directly for now. # [cite: 231]
+        processed_output_filename = generate_output_filename(topic_focus, domain) # [cite: 231]
+        processed_output_filepath = os.path.join(OUTPUT_DIR, processed_output_filename) # [cite: 231]
+
+        print(f"[Main] Saving consolidated documentation to: {processed_output_filepath}")
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(processed_output_filepath), exist_ok=True) # [cite: 231]
+            with open(processed_output_filepath, "w", encoding="utf-8") as f:
+                # Write Header # [cite: 232]
+                f.write(f"Documentation for: {topic_focus} ({domain})\n") # [cite: 232]
+                f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n") # [cite: 232]
+                f.write(f"Source URL: {start_url}\n") # [cite: 232]
+                f.write(f"Max Depth: {MAX_DEPTH}\n") # [cite: 232]
+                 # TODO: Get actual models used if process_scraped_data returned them # [cite: 233]
+                f.write(f"Extraction Model: {final_extraction_model}\n") # [cite: 233]
+                f.write(f"Consolidation Model: {final_consolidation_model}\n") # [cite: 233]
+                cont_sem_thresh_str = 'Disabled' if not content_semantic_enabled else f"{CONTENT_SEMANTIC_THRESHOLD:.2f}" # [cite: 233]
+                f.write(f"Content Filter Settings: Semantic Similarity={cont_sem_thresh_str}\n") # [cite: 233]
+                f.write("="*80 + "\n\n") # [cite: 234]
+                # Write Main Content
+                f.write(consolidated_text) # [cite: 234]
+
+                # IMPROVEMENT: Removed quality rating append from main file
+                # if quality_rating:
+                #     f.write("\n\n" + "="*80 + "\n")
+                #     f.write("## Quality Assessment (Generated by AI)\n")
+                #     f.write("="*80 + "\n\n")
+                #     rating_val = quality_rating.get('rating_score', 'N/A')
+                #     f.write(f"- **Rating Score (1-10):** {rating_val if rating_val is not None else 'N/A'}\n") # [cite: 235]
+                #     f.write(f"- **Justification:**\n{quality_rating.get('rating_justification', 'N/A')}\n") # [cite: 236]
+                #     f.write(f"- **Suggestions:**\n{quality_rating.get('rating_suggestions', 'N/A')}\n") # [cite: 236]
+            print(f"[Main] Successfully saved documentation.") # [cite: 236]
+
+            # --- IMPROVEMENT: Save Quality Assessment Separately ---
+            if quality_rating:
+                quality_filename = generate_output_filename(topic_focus, domain, extension="_quality_assessment.json") # Save as JSON for easier parsing
+                quality_filepath = os.path.join(OUTPUT_QUALITY_DIR, quality_filename)
+                print(f"[Main] Saving quality assessment to: {quality_filepath}")
+                try:
+                    # Ensure directory exists (might be redundant, but safe)
+                    os.makedirs(os.path.dirname(quality_filepath), exist_ok=True)
+                    with open(quality_filepath, "w", encoding="utf-8") as qf:
+                        # Convert None score to string 'N/A' for JSON compatibility if needed, or handle in reading code
+                        # quality_rating['rating_score'] = quality_rating.get('rating_score') if quality_rating.get('rating_score') is not None else 'N/A'
+                        json.dump(quality_rating, qf, indent=2, ensure_ascii=False)
+                    print("[Main] Successfully saved quality assessment.")
+                except OSError as qe:
+                     print(f"[Main] Error saving quality assessment to {quality_filepath}: {qe}")
+                     traceback.print_exc()
+                except Exception as qe_unexpected:
+                     print(f"[Main] Unexpected error saving quality assessment: {type(qe_unexpected).__name__} - {qe_unexpected}")
+                     traceback.print_exc()
+
+            # --- Compilation Step ---
+            # Compile *after* saving the individual processed file # [cite: 236]
+            if not SKIP_COMPILATION: # [cite: 237]
+                print("\n[Main] Starting final compilation step...") # [cite: 237]
+                try:
+                    # Compile files from OUTPUT_DIR into DEFAULT_COMPILED_OUTPUT_FILE
+                    compile_txt_files(input_dir=OUTPUT_DIR, output_file=config.DEFAULT_COMPILED_OUTPUT_FILE) # [cite: 237]
+                except Exception as e: # [cite: 237]
+                    print(f"[Main] Error during compilation: {type(e).__name__} - {e}") # [cite: 238]
+                    traceback.print_exc() # [cite: 238]
+            else:
+                print("\n[Main] Skipping final compilation step as per config.") # [cite: 238]
+
+        except OSError as e: # [cite: 239]
+            print(f"[Main] Error saving documentation to {processed_output_filepath}: {e}") # [cite: 239]
+            traceback.print_exc() # [cite: 239]
+        except Exception as e:
+            print(f"[Main] Unexpected error saving documentation: {type(e).__name__} - {e}") # [cite: 239]
+            traceback.print_exc()
+    else:
+        print("[Main] No consolidated text was generated to save.") # [cite: 239]
+        if not SKIP_COMPILATION: # [cite: 240]
+            print("[Main] Skipping compilation as no new content was generated.") # [cite: 240]
+
+
+    # --- Finish ---
+    end_time = time.perf_counter() # [cite: 240]
+    print("-" * 40)
+    print(f"[Main] Knowledge Hunter finished in {end_time - start_time:.2f} seconds.") # [cite: 240]
+    print("-" * 40)
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    input_start_url: Optional[str] = None
+    inferred_topic: Optional[str] = None
+    final_topic_focus: Optional[str] = None
+
+    # Handle Windows asyncio policy if needed before any async calls # [cite: 240]
+    if sys.platform == "win32" and isinstance(asyncio.get_event_loop_policy(), asyncio.DefaultEventLoopPolicy): # [cite: 241]
+         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()) # [cite: 241]
+
+    print("--- Knowledge Hunter Setup ---")
+    # Prompt for Start URL
+    while not input_start_url:
+        try:
+            url_input = input("Enter the Start URL to scrape: ").strip() # [cite: 241]
+            if not url_input:
+                 print("Start URL cannot be empty.") # [cite: 241]
+                 continue # [cite: 242]
+            # Basic validation: requires scheme and netloc
+            parsed = urlparse(url_input) # [cite: 242]
+            if url_input and parsed.scheme in ["http", "https"] and parsed.netloc: # [cite: 242]
+                input_start_url = url_input
+            else: # [cite: 243]
+                print("Invalid URL format. Please include http:// or https:// and a valid domain.") # [cite: 243]
+        except (EOFError, KeyboardInterrupt): # [cite: 244]
+            print("\nOperation cancelled by user during setup.")
+            sys.exit(0) # [cite: 244]
+
+    # Attempt Topic Inference BEFORE Prompting
+    if input_start_url:
+        try:
+             # Run the async inference function
+             inferred_topic = asyncio.run(infer_topic_from_url(input_start_url)) # [cite: 244]
+        except RuntimeError as e: # [cite: 245]
+             if "cannot be called from a running event loop" in str(e): # [cite: 245]
+                 print("[Setup Error] Cannot run topic inference from a running event loop. Try running the script directly.") # [cite: 245]
+                 # Attempt to get existing loop if available (e.g., in Jupyter)
+                 loop = asyncio.get_event_loop() # [cite: 245]
+                 if loop.is_running(): # [cite: 246]
+                     print("[Setup Info] Running inference in existing loop...") # [cite: 246]
+                     # Schedule the task and wait for it synchronously (use with caution)
+                     task = loop.create_task(infer_topic_from_url(input_start_url)) # [cite: 246]
+                     # This part is tricky and might block if not handled carefully
+                     # For simplicity here, we might just skip inference in this case
+                     print("[Setup Warning] Skipping topic inference due to running event loop conflict.") # [cite: 247]
+                     inferred_topic = None # [cite: 248]
+                 else:
+                      print(f"[Setup Error] Runtime error during topic inference: {e}") # [cite: 248]
+                      traceback.print_exc() # [cite: 249]
+             else:
+                 print(f"[Setup Error] Runtime error during topic inference: {e}") # [cite: 249]
+                 traceback.print_exc() # [cite: 249]
+        except Exception as infer_e:
+            print(f"[Setup Error] Error during topic inference: {type(infer_e).__name__}. Proceeding without inference.") # [cite: 249]
+            traceback.print_exc() # [cite: 250]
+
+    # Prompt for Topic Focus
+    while final_topic_focus is None:
+        try:
+            if inferred_topic:
+                prompt_message = f"Inferred topic: '{inferred_topic}'. Press Enter to accept, or enter a different topic: " # [cite: 250]
+            else:
+                prompt_message = "Enter topic focus (e.g., 'Asyncio usage', required): " # [cite: 251]
+
+            topic_input = input(prompt_message).strip() # [cite: 251]
+
+            if topic_input: # User entered a topic
+                final_topic_focus = topic_input # [cite: 251]
+                print(f"[Setup] Using user-provided topic: '{final_topic_focus}'") # [cite: 252]
+            elif inferred_topic: # User pressed Enter, accepting inferred topic
+                final_topic_focus = inferred_topic # [cite: 252]
+                print(f"[Setup] Accepted inferred topic: '{final_topic_focus}'") # [cite: 252]
+            else: # User pressed Enter but nothing was inferred
+                 print("Topic focus cannot be empty if not inferred. Please provide a topic.") # [cite: 252]
+        except (EOFError, KeyboardInterrupt): # [cite: 253]
+            print("\nOperation cancelled by user during setup.")
+            sys.exit(0) # [cite: 253]
+
+    # Run Main Logic
+    if input_start_url and final_topic_focus: # [cite: 253]
+        try:
+            # Ensure policy is set again just before main run if needed # [cite: 253]
+            # if sys.platform == "win32" and isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy): # [cite: 254]
+            #      asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            asyncio.run(main(start_url=input_start_url, topic_focus=final_topic_focus)) # [cite: 254]
+        except KeyboardInterrupt:
+            print("\n[Main] Operation cancelled by user.") # [cite: 254]
+        except RuntimeError as e:
+             if "cannot be called from a running event loop" in str(e): # [cite: 255]
+                 print("[Main Error] Cannot run main async logic from a running event loop.") # [cite: 255]
+             else:
+                 print(f"\n[Main Error] An unexpected runtime error occurred: {e}") # [cite: 255]
+             traceback.print_exc() # [cite: 255]
+        except Exception as e: # [cite: 256]
+            print(f"\n[Main Error] An unexpected error occurred: {type(e).__name__} - {e}") # [cite: 256]
+            traceback.print_exc() # [cite: 256]
+    else:
+        print("[Setup] Error: Missing Start URL or Topic Focus. Cannot proceed.") # [cite: 256]
+        sys.exit(1) # [cite: 257]
