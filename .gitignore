@@ -162,3 +162,5 @@ cython_debug/
 my_secrets
 
 *.txt
+embedding_cache.json
+.venv-info
