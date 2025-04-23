@@ -491,7 +491,6 @@ async def main(start_url: str, topic_focus: str):
                 f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n") # [cite: 232]
                 f.write(f"Source URL: {start_url}\n") # [cite: 232]
                 f.write(f"Max Depth: {MAX_DEPTH}\n") # [cite: 232]
-                 # TODO: Get actual models used if process_scraped_data returned them # [cite: 233]
                 f.write(f"Extraction Model: {final_extraction_model}\n") # [cite: 233]
                 f.write(f"Consolidation Model: {final_consolidation_model}\n") # [cite: 233]
                 cont_sem_thresh_str = 'Disabled' if not content_semantic_enabled else f"{CONTENT_SEMANTIC_THRESHOLD:.2f}" # [cite: 233]
